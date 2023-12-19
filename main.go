@@ -94,9 +94,17 @@ func main() {
 		}
 	}
 
+	pauseIfNoArgs := func ()  {
+		if len(os.Args) == 1 {
+			bufio.NewScanner(os.Stdin).Scan()
+		}
+	}
+
 	f, err := login(username, password)
 	if err != nil {
-		panic(err)
+		fmt.Println(err)
+		pauseIfNoArgs()
+		os.Exit(1)
 	}
 
 	f.PrintDevInfo()
@@ -111,6 +119,7 @@ func main() {
 
 	decryptAndPrint(cfgData)
 	f.Clear()
+	pauseIfNoArgs()
 }
 
 func login(username, psd string) (*F650, error) {
@@ -216,10 +225,6 @@ func (f *F650) Clear() {
 	req.AddCookie(f.cookie)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	(&http.Client{}).Do(req)
-	if len(os.Args) == 1 {
-		scanner := bufio.NewScanner(os.Stdin)
-		scanner.Scan()
-	}
 }
 
 func (f *F650) PrintDevInfo() {
